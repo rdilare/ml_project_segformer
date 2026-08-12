@@ -16,16 +16,30 @@ DATA_ROOT/
     flood_test_data.csv
 ```
 
-### Colab: mount Drive (dataset already downloaded)
+### Colab: attach dataset from Drive
 
-```python
-from google.colab import drive
-drive.mount("/content/drive")
+From the repo root in a Colab cell:
 
-DATA_ROOT = "/content/drive/MyDrive/sen1floods11_hand"
+```bash
+!python scripts/colab_attach_data.py
 ```
 
-If you still need to download once:
+This mounts Drive, checks `S1/` / `Labels/` / `splits/`, and writes
+`/content/sen1floods11_data_root.txt`. Default root:
+
+`/content/drive/MyDrive/sen1floods11_hand`
+
+Optional:
+
+```bash
+# custom path
+!python scripts/colab_attach_data.py --data-root /content/drive/MyDrive/sen1floods11_hand
+
+# one-time download from GCS if the folder is empty
+!python scripts/colab_attach_data.py --download
+```
+
+If you still need to download manually:
 
 ```python
 !mkdir -p {DATA_ROOT}/S1 {DATA_ROOT}/Labels {DATA_ROOT}/splits
