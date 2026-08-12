@@ -18,38 +18,32 @@ DATA_ROOT/
 
 ### Colab: attach dataset from Drive
 
-From the repo root in a Colab cell:
+`drive.mount` must run in the **notebook kernel** (not under `!python`).
 
-```bash
-!python scripts/colab_attach_data.py
-```
-
-This mounts Drive, checks `S1/` / `Labels/` / `splits/`, and writes
-`/content/sen1floods11_data_root.txt`. Default root:
-
-`/content/drive/MyDrive/sen1floods11_hand`
-
-Optional:
-
-```bash
-# custom path
-!python scripts/colab_attach_data.py --data-root /content/drive/MyDrive/sen1floods11_hand
-
-# one-time download from GCS if the folder is empty
-!python scripts/colab_attach_data.py --download
-```
-
-If you still need to download manually:
+**Option A — one cell (`%run`):**
 
 ```python
-!mkdir -p {DATA_ROOT}/S1 {DATA_ROOT}/Labels {DATA_ROOT}/splits
-%cd {DATA_ROOT}
+%run scripts/colab_attach_data.py
+```
 
-!gsutil cp gs://sen1floods11/v1.1/splits/flood_handlabeled/flood_train_data.csv splits/
-!gsutil cp gs://sen1floods11/v1.1/splits/flood_handlabeled/flood_valid_data.csv splits/
-!gsutil cp gs://sen1floods11/v1.1/splits/flood_handlabeled/flood_test_data.csv splits/
-!gsutil -m rsync -r gs://sen1floods11/v1.1/data/flood_events/HandLabeled/S1Hand S1
-!gsutil -m rsync -r gs://sen1floods11/v1.1/data/flood_events/HandLabeled/LabelHand Labels
+**Option B — mount, then verify:**
+
+```python
+from google.colab import drive
+drive.mount("/content/drive")
+```
+
+```bash
+!python scripts/colab_attach_data.py --no-mount
+```
+
+Checks `S1/` / `Labels/` / `splits/` and writes `/content/sen1floods11_data_root.txt`.
+Default root: `/content/drive/MyDrive/sen1floods11_hand`
+
+Optional download if the folder is empty:
+
+```python
+%run scripts/colab_attach_data.py --download
 ```
 
 ## Setup

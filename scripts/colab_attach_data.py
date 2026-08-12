@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """Attach Sen1Floods11 hand-set on Google Colab via Drive.
 
-Default layout (already downloaded on Drive)::
+``drive.mount`` only works inside the notebook kernel — not under ``!python``.
+
+Preferred Colab usage (one cell)::
+
+    %run scripts/colab_attach_data.py
+
+Or two cells::
+
+    from google.colab import drive
+    drive.mount("/content/drive")
+
+    !python scripts/colab_attach_data.py --no-mount
+
+Default layout::
 
     /content/drive/MyDrive/sen1floods11_hand/
       S1/
       Labels/
       splits/
 
-Usage in a Colab cell::
-
-    !python scripts/colab_attach_data.py
-    # or with a custom path / one-time download:
-    !python scripts/colab_attach_data.py --data-root /content/drive/MyDrive/sen1floods11_hand
-    !python scripts/colab_attach_data.py --download
-
-Prints DATA_ROOT and writes ``/content/sen1floods11_data_root.txt`` for later cells.
+Writes ``/content/sen1floods11_data_root.txt`` for later cells.
 """
 
 from __future__ import annotations
@@ -53,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-mount",
         action="store_true",
-        help="Skip drive.mount (use when data is already under /content)",
+        help="Skip drive.mount (Drive already mounted in a notebook cell)",
     )
     p.add_argument(
         "--download",
@@ -68,12 +74,47 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def drive_already_mounted(mount_point: str) -> bool:
+    mydrive = Path(mount_point) / "MyDrive"
+    try:
+        return mydrive.is_dir() and any(mydrive.iterdir())
+    except OSError:
+        return False
+
+
+def can_call_drive_mount() -> bool:
+    """drive.mount needs a live IPython kernel (notebook cell or %run)."""
+    try:
+        from IPython import get_ipython  # type: ignore
+
+        ip = get_ipython()
+        return ip is not None and getattr(ip, "kernel", None) is not None
+    except Exception:
+        return False
+
+
 def mount_drive(mount_point: str) -> None:
+    if drive_already_mounted(mount_point):
+        print(f"Drive already mounted at {mount_point}")
+        return
+
+    if not can_call_drive_mount():
+        raise SystemExit(
+            "drive.mount() cannot run under `!python` (no notebook kernel).\n\n"
+            "Use one of these in Colab:\n\n"
+            "  # Option A — same cell as the notebook kernel:\n"
+            "  %run scripts/colab_attach_data.py\n\n"
+            "  # Option B — mount first, then verify:\n"
+            "  from google.colab import drive\n"
+            '  drive.mount("/content/drive")\n'
+            "  !python scripts/colab_attach_data.py --no-mount\n"
+        )
+
     try:
         from google.colab import drive  # type: ignore
     except ImportError as e:
         raise SystemExit(
-            "google.colab not available. Run this on Colab, or pass --no-mount "
+            "google.colab not available. Run on Colab, or pass --no-mount "
             "with a local --data-root."
         ) from e
 
@@ -166,23 +207,29 @@ def download_hand_set(root: Path) -> None:
 
 def write_marker(root: Path) -> None:
     MARKER_FILE.write_text(str(root.resolve()) + "\n", encoding="utf-8")
-    # Also export for the current process / !bash children in same cell if sourced
     os.environ["SEN1FLOODS11_DATA_ROOT"] = str(root.resolve())
 
 
-def main() -> None:
-    args = parse_args()
-    root = Path(args.data_root)
+def attach(
+    data_root: str | Path = DEFAULT_DRIVE_ROOT,
+    *,
+    mount_point: str = "/content/drive",
+    no_mount: bool = False,
+    download: bool = False,
+    force_download: bool = False,
+) -> Path:
+    """Attach dataset; callable from a Colab notebook cell."""
+    root = Path(data_root)
 
-    if not args.no_mount:
-        mount_drive(args.mount_point)
+    if not no_mount:
+        mount_drive(mount_point)
 
-    if args.download or args.force_download:
-        if args.force_download or verify_layout(root):
+    if download or force_download:
+        if force_download or verify_layout(root):
             print(f"Downloading hand set into {root} ...")
             download_hand_set(root)
         else:
-            print(f"Layout OK — skip download (use --force-download to re-sync)")
+            print("Layout OK — skip download (use force_download=True to re-sync)")
 
     problems = verify_layout(root)
     if problems:
@@ -190,7 +237,7 @@ def main() -> None:
         for p in problems:
             print(f"  - {p}", file=sys.stderr)
         print(
-            "\nFix: confirm Drive path, or re-run with --download",
+            "\nFix: confirm Drive path, or re-run with download=True / --download",
             file=sys.stderr,
         )
         raise SystemExit(1)
@@ -212,6 +259,18 @@ def main() -> None:
         f"    --data-root {root} \\\n"
         f"    --out-dir {root}/runs/segformer_ft \\\n"
         f"    --fp16"
+    )
+    return root
+
+
+def main() -> None:
+    args = parse_args()
+    attach(
+        args.data_root,
+        mount_point=args.mount_point,
+        no_mount=args.no_mount,
+        download=args.download,
+        force_download=args.force_download,
     )
 
 
