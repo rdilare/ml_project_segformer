@@ -260,9 +260,13 @@ def s1_to_pseudo_rgb(
     db_min: float = -30.0,
     db_max: float = 0.0,
 ) -> np.ndarray:
-    """Stack VV/VH/VH, clip dB → [0,1]. Returns (H, W, 3) float32."""
-    # stack = np.stack([vv, vh, vh], axis=-1).astype(np.float32)
-    stack = np.stack([vv, vh, 0.5*(vv+vh)], axis=-1).astype(np.float32)
+    """Stack VV/VH/mean, clip dB → [0,1]. Returns (H, W, 3) float32.
+
+    SAR GeoTIFFs often contain NaN nodata; those must be filled or the
+    network loss becomes NaN immediately.
+    """
+    stack = np.stack([vv, vh, 0.5 * (vv + vh)], axis=-1).astype(np.float32)
+    stack = np.nan_to_num(stack, nan=db_min, posinf=db_max, neginf=db_min)
     stack = np.clip(stack, db_min, db_max)
     stack = (stack - db_min) / max(db_max - db_min, 1e-6)
     return stack

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 import time
@@ -46,6 +47,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from baselines.common import (  # noqa: E402
+    IGNORE_INDEX,
     add_confusion,
     choose_stems_for_viz,
     confusion_counts,
@@ -154,10 +156,43 @@ def load_model(model_id: str, device: torch.device) -> SegformerForSemanticSegme
         label2id={"not_water": 0, "water": 1},
         ignore_mismatched_sizes=True,
     )
-    # Sen1Floods11 nodata; HF default ignore is 255
-    model.config.semantic_loss_ignore_index = -1
+    # Sen1Floods11 nodata is -1 (HF default ignore is 255)
+    model.config.semantic_loss_ignore_index = IGNORE_INDEX
     model.to(device)
     return model
+
+
+def segmentation_ce_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    ignore_index: int = IGNORE_INDEX,
+) -> torch.Tensor:
+    """fp32 CE; returns 0 if a batch has no valid (non-ignore) pixels.
+
+    HF CE under autocast / all-ignore batches can yield NaN and poison training.
+    """
+    logits = logits.float()
+    if logits.shape[-2:] != labels.shape[-2:]:
+        logits = F.interpolate(
+            logits, size=labels.shape[-2:], mode="bilinear", align_corners=False
+        )
+    if not (labels != ignore_index).any():
+        return logits.sum() * 0.0
+    return F.cross_entropy(logits, labels, ignore_index=ignore_index)
+
+
+def forward_logits(
+    model: SegformerForSemanticSegmentation,
+    pixel_values: torch.Tensor,
+    *,
+    use_fp16: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    if use_fp16 and device.type == "cuda":
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            return model(pixel_values=pixel_values).logits
+    return model(pixel_values=pixel_values).logits
 
 
 @torch.no_grad()
@@ -173,19 +208,17 @@ def evaluate(
     for batch in loader:
         pixel_values = batch["pixel_values"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
-        if use_fp16 and device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                out = model(pixel_values=pixel_values, labels=labels)
-        else:
-            out = model(pixel_values=pixel_values, labels=labels)
-        loss_sum += float(out.loss.detach())
-        n_batches += 1
-        logits = out.logits.float()
-        if logits.shape[-2:] != labels.shape[-2:]:
-            logits = F.interpolate(
-                logits, size=labels.shape[-2:], mode="bilinear", align_corners=False
+        logits = forward_logits(model, pixel_values, use_fp16=use_fp16, device=device)
+        loss = segmentation_ce_loss(logits, labels)
+        if torch.isfinite(loss):
+            loss_sum += float(loss)
+            n_batches += 1
+        logits_f = logits.float()
+        if logits_f.shape[-2:] != labels.shape[-2:]:
+            logits_f = F.interpolate(
+                logits_f, size=labels.shape[-2:], mode="bilinear", align_corners=False
             )
-        preds = logits.argmax(dim=1)
+        preds = logits_f.argmax(dim=1)
         for i in range(preds.shape[0]):
             add_confusion(
                 totals,
@@ -213,32 +246,49 @@ def train_one_epoch(
     model.train()
     optimizer.zero_grad(set_to_none=True)
     loss_sum, n_steps = 0.0, 0
+    skipped = 0
     for step, batch in enumerate(loader, start=1):
         pixel_values = batch["pixel_values"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
-        if use_fp16 and device.type == "cuda" and scaler is not None:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                out = model(pixel_values=pixel_values, labels=labels)
-                loss = out.loss / grad_accum
+        if not torch.isfinite(pixel_values).all():
+            pixel_values = torch.nan_to_num(pixel_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+        logits = forward_logits(model, pixel_values, use_fp16=use_fp16, device=device)
+        loss = segmentation_ce_loss(logits, labels) / grad_accum
+
+        if not torch.isfinite(loss):
+            skipped += 1
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        if scaler is not None and use_fp16 and device.type == "cuda":
             scaler.scale(loss).backward()
         else:
-            out = model(pixel_values=pixel_values, labels=labels)
-            loss = out.loss / grad_accum
             loss.backward()
 
-        loss_sum += float(out.loss.detach())
+        loss_sum += float(loss.detach()) * grad_accum
         n_steps += 1
 
         if step % grad_accum == 0 or step == len(loader):
+            # optimizer.step() before lr_scheduler.step(); with GradScaler,
+            # skip the LR step if the optimizer step was skipped (inf/nan grads).
+            stepped = True
             if scaler is not None and use_fp16 and device.type == "cuda":
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                stepped = scaler.get_scale() >= scale_before
             else:
                 optimizer.step()
-            scheduler.step()
+            if stepped:
+                scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
-    return loss_sum / max(n_steps, 1)
+    if skipped:
+        print(f"  warning: skipped {skipped} non-finite loss batches this epoch")
+    if n_steps == 0:
+        return float("nan")
+    return loss_sum / n_steps
 
 
 @torch.inference_mode()
@@ -343,23 +393,29 @@ def smoke_test(
     batch = next(iter(train_loader))
     pixel_values = batch["pixel_values"].to(device)
     labels = batch["labels"].to(device)
+    if not torch.isfinite(pixel_values).all():
+        n_bad = int((~torch.isfinite(pixel_values)).sum())
+        print(f"smoke warning: {n_bad} non-finite input values (will nan_to_num)")
+        pixel_values = torch.nan_to_num(pixel_values, nan=0.0, posinf=0.0, neginf=0.0)
+    uniq = torch.unique(labels).tolist()
+    print(f"smoke labels unique={uniq}  ignore_index={IGNORE_INDEX}")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
     t0 = time.time()
-    if use_fp16 and device.type == "cuda":
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
-            out = model(pixel_values=pixel_values, labels=labels)
-        out.loss.backward()
-    else:
-        out = model(pixel_values=pixel_values, labels=labels)
-        out.loss.backward()
+    logits = forward_logits(model, pixel_values, use_fp16=use_fp16, device=device)
+    loss = segmentation_ce_loss(logits, labels)
+    if not torch.isfinite(loss):
+        raise SystemExit(
+            f"smoke FAILED: non-finite loss={loss}. Check SAR NaNs / label values."
+        )
+    loss.backward()
     if device.type == "cuda":
         torch.cuda.synchronize()
         peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
-        print(f"smoke OK  loss={float(out.loss):.4f}  time={time.time()-t0:.2f}s  peak_vram={peak_mb:.0f} MiB")
+        print(f"smoke OK  loss={float(loss):.4f}  time={time.time()-t0:.2f}s  peak_vram={peak_mb:.0f} MiB")
     else:
-        print(f"smoke OK  loss={float(out.loss):.4f}  time={time.time()-t0:.2f}s  device={device}")
+        print(f"smoke OK  loss={float(loss):.4f}  time={time.time()-t0:.2f}s  device={device}")
 
 
 def main() -> None:
@@ -473,6 +529,15 @@ def main() -> None:
         best_epoch = int(state.get("best_epoch", state.get("epoch", -1)))
         bad_epochs = int(state.get("bad_epochs", 0))
         start_epoch = int(state["epoch"]) + 1
+        if any(
+            (not math.isfinite(float(r.get("train_loss", 0))))
+            or (not math.isfinite(float(r.get("val_loss", 0))))
+            for r in history
+        ):
+            raise SystemExit(
+                f"Checkpoint {resume_path} has non-finite losses (poisoned run). "
+                f"Delete last.pt/best.pt under {args.out_dir} and re-run with --no-resume."
+            )
         print(
             f"Resumed from {resume_path}  "
             f"(next epoch={start_epoch}, best_val_water_iou={best_iou:.4f} @ epoch {best_epoch})"
@@ -521,6 +586,13 @@ def main() -> None:
             f"val_water_iou={val_metrics['water_iou']:.4f}  "
             f"val_miou={val_metrics['miou']:.4f}  ({dt:.1f}s)"
         )
+
+        if not math.isfinite(train_loss) or not math.isfinite(val_metrics["loss"]):
+            raise SystemExit(
+                "Non-finite loss — aborting so we don't write a poisoned checkpoint. "
+                "Re-copy the latest train/ + baselines/common.py, delete bad "
+                f"{args.out_dir}/last.pt and best.pt if present, then re-run with --no-resume."
+            )
 
         is_best = val_metrics["water_iou"] > best_iou
         if is_best:

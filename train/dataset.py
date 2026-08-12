@@ -120,7 +120,11 @@ class Sen1Floods11SegDataset(Dataset):
 
         # Clip after multiplicative noise; keep ignore pixels as IGNORE_INDEX
         rgb01 = np.clip(rgb01, 0.0, 1.0).astype(np.float32)
+        rgb01 = np.nan_to_num(rgb01, nan=0.0, posinf=1.0, neginf=0.0)
         label = label.astype(np.int64)
+        # Sen1Floods11: {-1,0,1}; anything else → ignore (avoids CE OOB → NaN)
+        valid = (label == 0) | (label == 1) | (label == IGNORE_INDEX)
+        label = np.where(valid, label, IGNORE_INDEX).astype(np.int64)
 
         chw = normalize_imagenet_chw(rgb01)
         pixel_values = torch.from_numpy(chw)
