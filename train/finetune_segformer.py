@@ -5,7 +5,9 @@ Designed for Colab T4: fp16, batch 4–8, grad accumulation, early stop on
 val water IoU. Checkpoints + metrics go under --out-dir (put that on Drive).
 
 Every epoch writes ``last.pt`` (full train state) and, on improvement,
-``best.pt`` + ``best_hf/``. Resume after a disconnect with ``--resume``.
+``best.pt`` + ``best_hf/``. By default the script auto-resumes from
+``out-dir/last.pt`` (else ``best.pt``) when present; otherwise starts
+from scratch. Use ``--no-resume`` to force a fresh run.
 
 Does NOT download data. Point --data-root at your hand set::
 
@@ -21,8 +23,8 @@ Colab example::
     --out-dir /content/drive/MyDrive/sen1floods11_hand/runs/segformer_ft \\
     --fp16
 
-  # After interrupt / disconnect:
-  python train/finetune_segformer.py ... --fp16 --resume
+  # After interrupt / disconnect, re-run the same command (auto-resumes).
+  # Force a fresh run: add --no-resume
 """
 
 from __future__ import annotations
@@ -111,11 +113,17 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         nargs="?",
         const="auto",
-        default=None,
+        default="auto",
         help=(
-            "Resume from a checkpoint. Use --resume alone for out-dir/last.pt, "
-            "or --resume PATH to a .pt file"
+            "Resume if a checkpoint exists under --out-dir (default: auto = "
+            "last.pt, else best.pt). Pass a .pt path to force that file, or "
+            "use --no-resume to start from scratch"
         ),
+    )
+    p.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore existing checkpoints and train from scratch",
     )
     return p.parse_args()
 
@@ -200,7 +208,7 @@ def train_one_epoch(
     *,
     use_fp16: bool,
     grad_accum: int,
-    scaler: torch.cuda.amp.GradScaler | None,
+    scaler: torch.amp.GradScaler | None,
 ) -> float:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -267,7 +275,7 @@ def save_checkpoint(
     model: SegformerForSemanticSegmentation,
     optimizer: torch.optim.Optimizer,
     scheduler,
-    scaler: torch.cuda.amp.GradScaler | None,
+    scaler: torch.amp.GradScaler | None,
     *,
     epoch: int,
     best_metric: float,
@@ -304,12 +312,25 @@ def load_train_state(path: Path, device: torch.device) -> dict:
         return torch.load(path, map_location=device)
 
 
-def resolve_resume_path(resume: str | None, out_dir: Path) -> Path | None:
-    if resume is None:
+def resolve_resume_path(resume: str | None, out_dir: Path, *, no_resume: bool) -> Path | None:
+    """Pick a checkpoint to resume, or None to start from scratch."""
+    if no_resume or resume is None:
         return None
     if resume == "auto":
-        return out_dir / "last.pt"
-    return Path(resume)
+        for name in ("last.pt", "best.pt"):
+            cand = out_dir / name
+            if cand.is_file():
+                return cand
+        return None
+    path = Path(resume)
+    return path if path.is_file() else None
+
+
+def make_grad_scaler(enabled: bool) -> torch.amp.GradScaler | None:
+    if not enabled:
+        return None
+    # torch.amp.GradScaler('cuda') — torch.cuda.amp.GradScaler is deprecated
+    return torch.amp.GradScaler("cuda", enabled=True)
 
 
 def smoke_test(
@@ -426,7 +447,7 @@ def main() -> None:
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16) if device.type == "cuda" else None
+    scaler = make_grad_scaler(use_fp16) if device.type == "cuda" else None
 
     history: list[dict] = []
     best_iou = -1.0
@@ -436,10 +457,10 @@ def main() -> None:
     last_path = args.out_dir / "last.pt"
     best_path = args.out_dir / "best.pt"
 
-    resume_path = resolve_resume_path(args.resume, args.out_dir)
-    if resume_path is not None:
-        if not resume_path.exists():
-            raise SystemExit(f"--resume requested but checkpoint not found: {resume_path}")
+    resume_path = resolve_resume_path(args.resume, args.out_dir, no_resume=args.no_resume)
+    if args.no_resume:
+        print("--no-resume: starting from scratch")
+    elif resume_path is not None:
         state = load_train_state(resume_path, device)
         model.load_state_dict(state["model_state_dict"])
         optimizer.load_state_dict(state["optimizer_state_dict"])
@@ -458,6 +479,14 @@ def main() -> None:
         )
         if start_epoch > args.epochs:
             print(f"Checkpoint already finished {args.epochs} epochs; skipping train loop.")
+    else:
+        if args.resume not in (None, "auto"):
+            print(f"Checkpoint not found: {args.resume}; starting from scratch")
+        else:
+            print(
+                f"No checkpoint found under {args.out_dir} "
+                f"(looked for last.pt / best.pt); starting from scratch"
+            )
 
     print(
         f"Training epochs {start_epoch}..{args.epochs}  "

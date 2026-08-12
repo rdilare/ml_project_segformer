@@ -86,19 +86,9 @@ Outputs under `--out-dir`:
 - `history.json` — per-epoch log (updated each epoch)
 - `figures/` — qualitative panels
 
-Resume after Colab disconnect / interrupt (same `--out-dir`):
-
-```bash
-!python train/finetune_segformer.py \
-  --data-root /content/drive/MyDrive/sen1floods11_hand \
-  --out-dir /content/drive/MyDrive/sen1floods11_hand/runs/segformer_ft \
-  --fp16 \
-  --batch-size 4 \
-  --grad-accum 4 \
-  --epochs 40 \
-  --patience 8 \
-  --resume
-```
+Resume after Colab disconnect / interrupt: re-run the **same** command with the
+same `--out-dir`. It auto-loads `last.pt` (else `best.pt`) when present; if
+none exist, it starts from scratch. Force a fresh run with `--no-resume`.
 
 Compare test **water IoU** to the VH threshold baseline (~0.53).
 
