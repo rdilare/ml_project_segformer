@@ -4,6 +4,9 @@
 Designed for Colab T4: fp16, batch 4–8, grad accumulation, early stop on
 val water IoU. Checkpoints + metrics go under --out-dir (put that on Drive).
 
+Every epoch writes ``last.pt`` (full train state) and, on improvement,
+``best.pt`` + ``best_hf/``. Resume after a disconnect with ``--resume``.
+
 Does NOT download data. Point --data-root at your hand set::
 
   DATA_ROOT/
@@ -17,6 +20,9 @@ Colab example::
     --data-root /content/drive/MyDrive/sen1floods11_hand \\
     --out-dir /content/drive/MyDrive/sen1floods11_hand/runs/segformer_ft \\
     --fp16
+
+  # After interrupt / disconnect:
+  python train/finetune_segformer.py ... --fp16 --resume
 """
 
 from __future__ import annotations
@@ -100,6 +106,16 @@ def parse_args() -> argparse.Namespace:
         "--smoke",
         action="store_true",
         help="One train step + one val batch, print peak CUDA memory, exit",
+    )
+    p.add_argument(
+        "--resume",
+        nargs="?",
+        const="auto",
+        default=None,
+        help=(
+            "Resume from a checkpoint. Use --resume alone for out-dir/last.pt, "
+            "or --resume PATH to a .pt file"
+        ),
     )
     return p.parse_args()
 
@@ -250,25 +266,50 @@ def save_checkpoint(
     path: Path,
     model: SegformerForSemanticSegmentation,
     optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler: torch.cuda.amp.GradScaler | None,
+    *,
     epoch: int,
     best_metric: float,
+    best_epoch: int,
+    bad_epochs: int,
+    history: list[dict],
     args: argparse.Namespace,
+    save_hf: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "best_val_water_iou": best_metric,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "args": vars(args),
-        },
-        path,
-    )
-    # Also save HF-style weights for easy reload / ONNX later
-    hf_dir = path.parent / "best_hf"
-    hf_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(hf_dir)
+    payload = {
+        "epoch": epoch,
+        "best_val_water_iou": best_metric,
+        "best_epoch": best_epoch,
+        "bad_epochs": bad_epochs,
+        "history": history,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+        "args": vars(args),
+    }
+    torch.save(payload, path)
+    if save_hf:
+        hf_dir = path.parent / "best_hf"
+        hf_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(hf_dir)
+
+
+def load_train_state(path: Path, device: torch.device) -> dict:
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def resolve_resume_path(resume: str | None, out_dir: Path) -> Path | None:
+    if resume is None:
+        return None
+    if resume == "auto":
+        return out_dir / "last.pt"
+    return Path(resume)
 
 
 def smoke_test(
@@ -391,13 +432,38 @@ def main() -> None:
     best_iou = -1.0
     best_epoch = -1
     bad_epochs = 0
-    ckpt_path = args.out_dir / "best.pt"
+    start_epoch = 1
+    last_path = args.out_dir / "last.pt"
+    best_path = args.out_dir / "best.pt"
+
+    resume_path = resolve_resume_path(args.resume, args.out_dir)
+    if resume_path is not None:
+        if not resume_path.exists():
+            raise SystemExit(f"--resume requested but checkpoint not found: {resume_path}")
+        state = load_train_state(resume_path, device)
+        model.load_state_dict(state["model_state_dict"])
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+        if state.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(state["scheduler_state_dict"])
+        if scaler is not None and state.get("scaler_state_dict") is not None:
+            scaler.load_state_dict(state["scaler_state_dict"])
+        history = list(state.get("history") or [])
+        best_iou = float(state.get("best_val_water_iou", -1.0))
+        best_epoch = int(state.get("best_epoch", state.get("epoch", -1)))
+        bad_epochs = int(state.get("bad_epochs", 0))
+        start_epoch = int(state["epoch"]) + 1
+        print(
+            f"Resumed from {resume_path}  "
+            f"(next epoch={start_epoch}, best_val_water_iou={best_iou:.4f} @ epoch {best_epoch})"
+        )
+        if start_epoch > args.epochs:
+            print(f"Checkpoint already finished {args.epochs} epochs; skipping train loop.")
 
     print(
-        f"Training up to {args.epochs} epochs  "
+        f"Training epochs {start_epoch}..{args.epochs}  "
         f"(early stop patience={args.patience} on val water IoU)..."
     )
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         train_loss = train_one_epoch(
             model,
@@ -427,26 +493,66 @@ def main() -> None:
             f"val_miou={val_metrics['miou']:.4f}  ({dt:.1f}s)"
         )
 
-        if val_metrics["water_iou"] > best_iou:
+        is_best = val_metrics["water_iou"] > best_iou
+        if is_best:
             best_iou = val_metrics["water_iou"]
             best_epoch = epoch
             bad_epochs = 0
-            save_checkpoint(ckpt_path, model, optimizer, epoch, best_iou, args)
-            print(f"  ↑ new best val water IoU={best_iou:.4f}  saved {ckpt_path}")
         else:
             bad_epochs += 1
-            if bad_epochs >= args.patience:
-                print(f"Early stop at epoch {epoch} (best epoch {best_epoch})")
-                break
+
+        # Always write last.pt so Colab disconnects can resume.
+        save_checkpoint(
+            last_path,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            epoch=epoch,
+            best_metric=best_iou,
+            best_epoch=best_epoch,
+            bad_epochs=bad_epochs,
+            history=history,
+            args=args,
+            save_hf=False,
+        )
+        with open(args.out_dir / "history.json", "w") as f:
+            json.dump(history, f, indent=2)
+
+        if is_best:
+            save_checkpoint(
+                best_path,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch=epoch,
+                best_metric=best_iou,
+                best_epoch=best_epoch,
+                bad_epochs=bad_epochs,
+                history=history,
+                args=args,
+                save_hf=True,
+            )
+            print(f"  ↑ new best val water IoU={best_iou:.4f}  saved {best_path}")
+
+        if bad_epochs >= args.patience:
+            print(f"Early stop at epoch {epoch} (best epoch {best_epoch})")
+            break
 
     # Reload best weights
+    ckpt_path = best_path
     if ckpt_path.exists():
-        try:
-            state = torch.load(ckpt_path, map_location=device, weights_only=False)
-        except TypeError:
-            state = torch.load(ckpt_path, map_location=device)
+        state = load_train_state(ckpt_path, device)
         model.load_state_dict(state["model_state_dict"])
         print(f"Reloaded best checkpoint from epoch {state['epoch']}")
+    elif last_path.exists():
+        state = load_train_state(last_path, device)
+        model.load_state_dict(state["model_state_dict"])
+        print(f"No best.pt; using last checkpoint from epoch {state['epoch']}")
+        ckpt_path = last_path
+    else:
+        print("WARNING: no checkpoint found; evaluating current in-memory weights")
 
     print("Evaluating best checkpoint...")
     val_metrics = evaluate(model, val_loader, device, use_fp16)

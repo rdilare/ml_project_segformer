@@ -80,10 +80,25 @@ python train/finetune_segformer.py \
 
 Outputs under `--out-dir`:
 
-- `best.pt` / `best_hf/` — best weights
+- `last.pt` — full train state every epoch (use to resume)
+- `best.pt` / `best_hf/` — best weights by val water IoU
 - `metrics.json` — val + test scores
-- `history.json` — per-epoch log
+- `history.json` — per-epoch log (updated each epoch)
 - `figures/` — qualitative panels
+
+Resume after Colab disconnect / interrupt (same `--out-dir`):
+
+```bash
+!python train/finetune_segformer.py \
+  --data-root /content/drive/MyDrive/sen1floods11_hand \
+  --out-dir /content/drive/MyDrive/sen1floods11_hand/runs/segformer_ft \
+  --fp16 \
+  --batch-size 4 \
+  --grad-accum 4 \
+  --epochs 40 \
+  --patience 8 \
+  --resume
+```
 
 Compare test **water IoU** to the VH threshold baseline (~0.53).
 
