@@ -58,13 +58,13 @@ Drop a Hugging Face checkpoint at `models/best_hf/` (`config.json` + `model.safe
 
 ## Local UI
 
-Browse chips, run inference, evaluate splits, and launch baselines from the browser:
+Browse chips, run inference, compare chips × models, evaluate splits, and launch baselines from the browser:
 
 ```bash
 streamlit run app.py
 ```
 
-Set **Data root** (default `data/sen1floods11_hand`) and **Model dir** (default `models/best_hf/`) in the sidebar. The Results tab reads `outputs/*/metrics.json`.
+Set **Data root** (default `data/sen1floods11_hand`) and **Model dir** (default `models/best_hf/`) in the sidebar. The **Compare** tab runs several chips (or uploaded GeoTIFFs) through several Hugging Face checkpoints plus the VH baseline. The Results tab reads `outputs/*/metrics.json`.
 
 ## Fine-tune (Colab T4)
 

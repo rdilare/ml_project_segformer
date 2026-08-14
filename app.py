@@ -121,10 +121,7 @@ def scan_workspace(data_root: str, model_dir: str) -> dict:
     n_s1 = len(list(s1.glob("*.tif"))) if s1.is_dir() else 0
     n_lab = len(list(labels.glob("*.tif"))) if labels.is_dir() else 0
     present = [name for name in SPLIT_CSV.values() if (splits / name).is_file()]
-    model = Path(model_dir)
-    has_model = (model / "config.json").is_file() and (
-        (model / "model.safetensors").is_file() or (model / "pytorch_model.bin").is_file()
-    )
+    has_model = is_hf_checkpoint(Path(model_dir))
     return {
         "n_s1": n_s1,
         "n_lab": n_lab,
@@ -133,6 +130,47 @@ def scan_workspace(data_root: str, model_dir: str) -> dict:
         "s1_ok": s1.is_dir(),
         "root_ok": root.is_dir(),
     }
+
+
+def is_hf_checkpoint(path: Path) -> bool:
+    path = Path(path)
+    return path.is_dir() and (path / "config.json").is_file() and (
+        (path / "model.safetensors").is_file() or (path / "pytorch_model.bin").is_file()
+    )
+
+
+def list_hf_checkpoints(*roots: Path) -> list[Path]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for raw in roots:
+        if raw is None:
+            continue
+        root = Path(raw).expanduser()
+        if not root.exists():
+            continue
+        candidates: list[Path] = []
+        if is_hf_checkpoint(root):
+            candidates.append(root)
+        if root.is_dir() and not is_hf_checkpoint(root):
+            for pattern in ("*/config.json", "*/*/config.json", "*/*/*/config.json"):
+                for cfg_path in sorted(root.glob(pattern)):
+                    parent = cfg_path.parent
+                    if is_hf_checkpoint(parent):
+                        candidates.append(parent)
+        for path in candidates:
+            key = str(path.resolve())
+            if key not in seen:
+                seen.add(key)
+                out.append(path)
+    return out
+
+
+def short_model_name(path: Path) -> str:
+    path = Path(path).resolve()
+    try:
+        return str(path.relative_to(REPO))
+    except ValueError:
+        return path.name if path.name != "best_hf" else str(path)
 
 
 @st.cache_data(show_spinner=False)
@@ -297,6 +335,19 @@ def extract_score_rows(path: Path, payload: dict) -> list[dict]:
     if "metrics" in payload:
         split = str(payload.get("split") or payload.get("stem") or "chip")
         row(split, payload.get("metrics"))
+    compare_rows = payload.get("rows")
+    if payload.get("method") == "compare" and isinstance(compare_rows, list):
+        for item in compare_rows:
+            if not isinstance(item, dict) or "water_iou" not in item:
+                continue
+            rows.append(
+                {
+                    "run": run,
+                    "method": str(item.get("model", method)),
+                    "split": str(item.get("chip", "chip")),
+                    **{k: item.get(k) for k in METRIC_COLS},
+                }
+            )
     return rows
 
 
@@ -848,6 +899,283 @@ def page_baselines(cfg: dict) -> None:
                 st.error(f"Exited with code {code}")
 
 
+def _compare_chip_jobs(cfg: dict, picked_stems: list[str], uploads) -> list[dict]:
+    jobs: list[dict] = []
+    for stem in picked_stems:
+        try:
+            s1_path, lab_path = resolve_chip_paths(cfg["data_root"], stem)
+        except FileNotFoundError as e:
+            st.warning(str(e))
+            continue
+        jobs.append(
+            {
+                "key": stem,
+                "stem": stem,
+                "s1_path": s1_path,
+                "lab_path": lab_path,
+            }
+        )
+    if not uploads:
+        return jobs
+    tmp_dir = Path(st.session_state.setdefault("_upload_dir", str(REPO / "outputs" / "_uploads")))
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    used = {j["key"] for j in jobs}
+    for uploaded in uploads:
+        s1_path = tmp_dir / uploaded.name
+        s1_path.write_bytes(uploaded.getbuffer())
+        stem = stem_from_path(s1_path)
+        key = stem if stem not in used else f"{stem} ({uploaded.name})"
+        used.add(key)
+        cand = cfg["data_root"] / "Labels" / f"{stem}_LabelHand.tif"
+        jobs.append(
+            {
+                "key": key,
+                "stem": stem,
+                "s1_path": s1_path,
+                "lab_path": cand if cand.exists() else None,
+            }
+        )
+    return jobs
+
+
+def page_compare(cfg: dict) -> None:
+    st.subheader("Compare chips × models")
+    st.caption(
+        "Pick several dataset chips and/or GeoTIFFs, plus several Hugging Face checkpoints. "
+        "Each chip is scored by every selected model (optional VH baseline too)."
+    )
+
+    stems = cfg["stems"]
+    default_stems = [cfg["stem"]] if cfg["stem"] in stems else []
+    picked_stems = st.multiselect(
+        "Dataset chips (from the sidebar split / country filter)",
+        stems,
+        default=default_stems,
+    )
+    uploads = st.file_uploader(
+        "Or upload Sentinel-1 GeoTIFFs (VV + VH)",
+        type=["tif", "tiff"],
+        accept_multiple_files=True,
+    )
+
+    discovered = list_hf_checkpoints(REPO / "models", cfg["model_dir"])
+    extra_text = st.text_area(
+        "Extra model dirs (one Hugging Face folder per line)",
+        placeholder="models/best_hf\n/path/to/another/best_hf",
+        height=80,
+    )
+    extra_roots = [Path(line.strip()) for line in extra_text.splitlines() if line.strip()]
+    if extra_roots:
+        discovered = list_hf_checkpoints(REPO / "models", cfg["model_dir"], *extra_roots)
+
+    model_labels = {short_model_name(p): p for p in discovered}
+    default_models = []
+    sidebar_name = short_model_name(cfg["model_dir"]) if is_hf_checkpoint(cfg["model_dir"]) else None
+    if sidebar_name and sidebar_name in model_labels:
+        default_models = [sidebar_name]
+    elif model_labels:
+        default_models = [next(iter(model_labels))]
+
+    picked_models = st.multiselect(
+        "Fine-tuned checkpoints",
+        list(model_labels),
+        default=default_models,
+    )
+    include_vh = st.checkbox(
+        f"Include VH threshold baseline ({cfg['vh_db']:.1f} dB)",
+        value=True,
+    )
+
+    if not torch_ok() and picked_models:
+        st.error("PyTorch is not installed in this environment. `pip install -r requirements.txt`")
+        return
+
+    run = st.button("Run comparison", type="primary")
+    if run:
+        jobs = _compare_chip_jobs(cfg, picked_stems, uploads)
+        methods: list[dict] = []
+        if include_vh:
+            methods.append({"id": "VH threshold", "kind": "vh"})
+        for name in picked_models:
+            methods.append({"id": name, "kind": "hf", "path": str(model_labels[name])})
+        if not jobs:
+            st.error("Select at least one dataset chip or upload a GeoTIFF.")
+        elif not methods:
+            st.error("Select at least one model (or the VH baseline).")
+        else:
+            n = len(jobs) * len(methods)
+            bar = st.progress(0.0, text="Starting…")
+            chips: list[dict] = []
+            step = 0
+            errors: list[str] = []
+            for job in jobs:
+                _vv, vh, label = load_chip_arrays(
+                    str(job["s1_path"]),
+                    str(job["lab_path"]) if job["lab_path"] else None,
+                )
+                item: dict = {
+                    "key": job["key"],
+                    "stem": job["stem"],
+                    "s1_path": str(job["s1_path"]),
+                    "vh": vh,
+                    "label": label,
+                    "rgb01": None,
+                    "probs": {},
+                    "vh_pred": None,
+                }
+                for method in methods:
+                    step += 1
+                    bar.progress(step / n, text=f"{job['key']}  ·  {method['id']}  ({step}/{n})")
+                    if method["kind"] == "vh":
+                        item["vh_pred"] = (vh <= cfg["vh_db"]).astype(np.uint8)
+                        continue
+                    try:
+                        _vv2, _vh, rgb01, prob = infer_chip_cached(
+                            method["path"],
+                            cfg["device_name"],
+                            str(job["s1_path"]),
+                            cfg["image_size"],
+                            cfg["db_min"],
+                            cfg["db_max"],
+                            cfg["use_fp16"],
+                        )
+                    except SystemExit as e:
+                        errors.append(f"{job['key']} / {method['id']}: {e}")
+                        continue
+                    except Exception as e:
+                        errors.append(f"{job['key']} / {method['id']}: {e}")
+                        continue
+                    item["rgb01"] = rgb01
+                    item["probs"][method["id"]] = prob
+                chips.append(item)
+
+            st.session_state["compare"] = {
+                "chips": chips,
+                "methods": methods,
+                "vh_db": cfg["vh_db"],
+            }
+            if errors:
+                st.warning("Some runs failed:\n" + "\n".join(errors))
+
+    bundle = st.session_state.get("compare")
+    if not bundle:
+        st.caption("Choose chips and models, then click **Run comparison**.")
+        return
+
+    thresh = st.slider(
+        "Water probability threshold (SegFormer only; 0.5 ≈ argmax)",
+        min_value=0.05,
+        max_value=0.95,
+        value=0.50,
+        step=0.01,
+        key="compare_thresh",
+    )
+
+    rows: list[dict] = []
+    rendered: list[dict] = []
+    for chip in bundle["chips"]:
+        label = chip["label"]
+        preds: dict[str, np.ndarray] = {}
+        metrics_by: dict[str, dict | None] = {}
+        for method in bundle["methods"]:
+            mid = method["id"]
+            if method["kind"] == "vh":
+                pred = chip.get("vh_pred")
+            else:
+                prob = chip["probs"].get(mid)
+                pred = None if prob is None else (prob >= thresh).astype(np.uint8)
+            if pred is None:
+                continue
+            preds[mid] = pred
+            metrics_by[mid] = metrics_or_none(pred, label)
+            row = {"chip": chip["key"], "model": mid}
+            if metrics_by[mid]:
+                row.update(metrics_by[mid])
+            rows.append(row)
+        rendered.append({"chip": chip, "preds": preds, "metrics_by": metrics_by})
+
+    df = pd.DataFrame(rows)
+    if not df.empty and "water_iou" in df.columns:
+        st.markdown("Water IoU (chip × model)")
+        iou = df.pivot_table(index="chip", columns="model", values="water_iou", aggfunc="first")
+        st.dataframe(iou.round(3), use_container_width=True)
+        mean_iou = iou.mean(axis=0).rename("mean water IoU")
+        st.bar_chart(mean_iou)
+        with st.expander("All metrics"):
+            show = df.copy()
+            for col in METRIC_COLS:
+                if col in show.columns:
+                    show[col] = pd.to_numeric(show[col], errors="coerce")
+            st.dataframe(
+                show[["chip", "model"] + [c for c in METRIC_COLS if c in show.columns]],
+                hide_index=True,
+                use_container_width=True,
+            )
+    elif df.empty:
+        st.info("No predictions to show. Re-run after fixing model paths.")
+        return
+    else:
+        st.caption("No ground-truth labels for these chips — predictions only.")
+
+    st.divider()
+    for i, item in enumerate(rendered):
+        chip = item["chip"]
+        with st.expander(chip["key"], expanded=(i == 0)):
+            st.caption(chip["s1_path"])
+            labeled = [m for m in bundle["methods"] if item["metrics_by"].get(m["id"])]
+            if labeled:
+                cols = st.columns(len(labeled))
+                for col, method in zip(cols, labeled):
+                    m = item["metrics_by"][method["id"]]
+                    col.metric(method["id"], f"{m['water_iou']:.3f}", help="water IoU")
+            panels = [(gray01(chip["vh"]), "VH")]
+            if chip["label"] is not None:
+                panels.append((make_gt_rgb(chip["label"]), "Ground truth"))
+            rgb01 = chip.get("rgb01")
+            if rgb01 is not None:
+                panels.append((np.clip(rgb01, 0, 1), "Model input"))
+            for method in bundle["methods"]:
+                pred = item["preds"].get(method["id"])
+                if pred is None:
+                    continue
+                caption = method["id"]
+                if method["kind"] == "vh":
+                    caption = f"VH ≤ {bundle['vh_db']:.1f} dB"
+                elif method["kind"] == "hf":
+                    caption = f"{method['id']}  P≥{thresh:.2f}"
+                panels.append((pred_rgb(pred), caption))
+            for start in range(0, len(panels), 5):
+                panel_row(panels[start : start + 5])
+            err_panels = []
+            if chip["label"] is not None:
+                for method in bundle["methods"]:
+                    pred = item["preds"].get(method["id"])
+                    if pred is None:
+                        continue
+                    err_panels.append((make_error_map(pred, chip["label"]), f"Error · {method['id']}"))
+            if err_panels:
+                st.caption("Error maps  G=TP  R=FP  B=FN")
+                for start in range(0, len(err_panels), 5):
+                    panel_row(err_panels[start : start + 5])
+
+    if st.button("Save comparison table"):
+        out_dir = REPO / "outputs" / "compare"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / "metrics.csv"
+        df.to_csv(csv_path, index=False)
+        payload = {
+            "method": "compare",
+            "threshold": thresh,
+            "vh_db": bundle["vh_db"],
+            "models": [m["id"] for m in bundle["methods"]],
+            "chips": [c["chip"]["key"] for c in rendered],
+            "rows": rows,
+        }
+        save_metrics_json(out_dir / "metrics.json", payload)
+        load_run_summaries.clear()
+        st.success(f"Wrote {csv_path} and {out_dir / 'metrics.json'}")
+
+
 def page_results() -> None:
     st.subheader("Saved runs")
     outputs = REPO / "outputs"
@@ -892,19 +1220,21 @@ def main() -> None:
     st.set_page_config(page_title="Sen1Floods11 SegFormer", layout="wide")
     st.title("Sen1Floods11 SegFormer")
     st.caption(
-        "Browse chips, run inference, evaluate splits, and compare baselines from the browser."
+        "Browse chips, run inference, compare models, evaluate splits, and launch baselines from the browser."
     )
     cfg = sidebar_config()
-    tabs = st.tabs(["Browse", "Infer", "Evaluate", "Baselines", "Results"])
+    tabs = st.tabs(["Browse", "Infer", "Compare", "Evaluate", "Baselines", "Results"])
     with tabs[0]:
         page_browse(cfg)
     with tabs[1]:
         page_infer(cfg)
     with tabs[2]:
-        page_evaluate(cfg)
+        page_compare(cfg)
     with tabs[3]:
-        page_baselines(cfg)
+        page_evaluate(cfg)
     with tabs[4]:
+        page_baselines(cfg)
+    with tabs[5]:
         page_results()
 
 
