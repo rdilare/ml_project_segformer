@@ -66,18 +66,26 @@ def build_eval_augs() -> A.Compose:
 def water_centered_crop(
     rgb01: np.ndarray,
     label: np.ndarray,
-    crop_size: int,
+    min_size: int,
+    max_size: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Crop around a random water pixel so thin streams occupy more of the tensor.
+    """Mild zoom around a random water pixel.
 
-    Dry chips (no class-1 pixels) are returned unchanged.
+    Crop side is drawn uniformly from ``[min_size, max_size]`` (max_size<=0
+    means the full chip). Dry chips are unchanged. A 384–512 crop on a 512
+    chip is at most ~1.3× zoom — not the old fixed 256→512 stretch.
     """
     h, w = label.shape[:2]
-    crop = min(int(crop_size), h, w)
-    if crop <= 0 or (crop == h and crop == w):
+    limit = min(h, w)
+    if limit <= 0:
         return rgb01, label
+    lo = min(max(int(min_size), 1), limit)
+    hi = limit if int(max_size) <= 0 else min(max(int(max_size), lo), limit)
     ys, xs = np.where(label == WATER)
     if ys.size == 0:
+        return rgb01, label
+    crop = int(random.randint(lo, hi))
+    if crop >= limit:
         return rgb01, label
     i = int(random.randrange(int(ys.size)))
     cy, cx = int(ys[i]), int(xs[i])
@@ -104,7 +112,8 @@ class Sen1Floods11SegDataset(Dataset):
         db_max: float = 0.0,
         augment: bool = False,
         water_crop_p: float = 0.0,
-        water_crop_size: int = 256,
+        water_crop_size: int = 384,
+        water_crop_max: int = 0,
     ) -> None:
         self.data_root = Path(data_root)
         self.s1_dir = s1_dir
@@ -114,6 +123,7 @@ class Sen1Floods11SegDataset(Dataset):
         self.db_max = db_max
         self.water_crop_p = float(water_crop_p)
         self.water_crop_size = int(water_crop_size)
+        self.water_crop_max = int(water_crop_max)
         self.augs = build_train_augs() if augment else build_eval_augs()
         self._water_counts: np.ndarray | None = None
 
@@ -163,7 +173,12 @@ class Sen1Floods11SegDataset(Dataset):
             label = out["mask"]
 
         if self.water_crop_p > 0.0 and random.random() < self.water_crop_p:
-            rgb01, label = water_centered_crop(rgb01, label, self.water_crop_size)
+            rgb01, label = water_centered_crop(
+                rgb01,
+                label,
+                min_size=self.water_crop_size,
+                max_size=self.water_crop_max,
+            )
 
         # Clip after multiplicative noise; keep ignore pixels as IGNORE_INDEX
         rgb01 = np.clip(rgb01, 0.0, 1.0).astype(np.float32)

@@ -5,9 +5,10 @@ Designed for Colab T4: fp16, batch 4–8, grad accumulation, early stop on
 val water IoU. Checkpoints + metrics go under --out-dir (put that on Drive).
 
 Loss is weighted CE (water up-weighted) + soft Dice so thin water is not
-drowned by land pixels. Train sampling over-represents sparse-water chips;
-optional water-centered crops zoom streams without changing 512 output size.
-Dry chips are kept as negatives (no copy-paste).
+drowned by land pixels. Sampling boosts sparse-water chips only (dry and
+large floods stay at baseline). Train crops are a mild random zoom around
+water, not a 2× stretch. Dry chips stay full-frame negatives (no copy-paste).
+LR is cosine with warmup, floored at ``--min-lr-ratio`` of peak (not 0).
 
 Every epoch writes ``last.pt`` (full train state), ``history.json``, and
 ``figures/training_curves.png``. On improvement, ``best.pt`` + ``best_hf/``.
@@ -47,6 +48,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -71,7 +73,7 @@ from eval.common import (  # noqa: E402
 from train.dataset import Sen1Floods11SegDataset, collate_fn  # noqa: E402
 
 try:
-    from transformers import SegformerForSemanticSegmentation, get_cosine_schedule_with_warmup
+    from transformers import SegformerForSemanticSegmentation
 except ImportError as e:  # pragma: no cover
     raise SystemExit("Install transformers: pip install transformers") from e
 
@@ -107,7 +109,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--lr", type=float, default=6e-5)
     p.add_argument("--weight-decay", type=float, default=0.01)
-    p.add_argument("--warmup-ratio", type=float, default=0.05)
+    p.add_argument("--warmup-ratio", type=float, default=0.1)
+    p.add_argument(
+        "--min-lr-ratio",
+        type=float,
+        default=0.1,
+        help="Cosine floor as a fraction of --lr (1.0 = no decay). Avoids LR→0",
+    )
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--patience", type=int, default=8, help="Early stop patience (epochs)")
     p.add_argument("--seed", type=int, default=24)
@@ -129,19 +137,37 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-oversample-sparse",
         action="store_true",
-        help="Uniform chip sampling instead of 1/sqrt(water pixels)",
+        help="Uniform chip sampling instead of boosting sparse-water chips",
+    )
+    p.add_argument(
+        "--small-water-boost",
+        type=float,
+        default=3.0,
+        help="Sampler weight for chips with 1..small-water-max GT water pixels",
+    )
+    p.add_argument(
+        "--dry-sample-weight",
+        type=float,
+        default=1.0,
+        help="Sampler weight for chips with no GT water (keep ≤ large-flood weight)",
     )
     p.add_argument(
         "--water-crop-p",
         type=float,
-        default=0.5,
-        help="Train-only P(crop around a water pixel). 0 disables. Dry chips unchanged",
+        default=0.3,
+        help="Train-only P(mild zoom around water). 0 disables. Dry chips unchanged",
     )
     p.add_argument(
         "--water-crop-size",
         type=int,
-        default=256,
-        help="Side length of water-centered crop before resize to --image-size",
+        default=384,
+        help="Minimum water-centered crop side; actual size is random in [min, max]",
+    )
+    p.add_argument(
+        "--water-crop-max",
+        type=int,
+        default=0,
+        help="Maximum water-centered crop side; 0 = full chip (mild zoom, not 2×)",
     )
     p.add_argument(
         "--small-water-max",
@@ -291,11 +317,49 @@ def extra_split_metrics(
     }
 
 
-def sparse_sample_weights(water_counts: np.ndarray) -> torch.Tensor:
-    """Higher weight for dry / thin-water chips; mean weight is 1."""
-    w = 1.0 / np.sqrt(water_counts.astype(np.float64) + 1.0)
+def sparse_sample_weights(
+    water_counts: np.ndarray,
+    *,
+    small_water_max: int,
+    small_boost: float = 3.0,
+    dry_weight: float = 1.0,
+    large_weight: float = 1.0,
+) -> torch.Tensor:
+    """Boost sparse-water chips only. Dry and large floods stay at baseline.
+
+    Do not use 1/sqrt(water): that gives dry chips the highest weight and
+    starves the large floods that dominate pooled IoU.
+    """
+    counts = water_counts.astype(np.float64)
+    w = np.full(counts.shape, float(large_weight), dtype=np.float64)
+    w[counts == 0] = float(dry_weight)
+    small = (counts > 0) & (counts <= float(small_water_max))
+    w[small] = float(small_boost)
     w = w / max(float(w.mean()), 1e-9)
     return torch.as_tensor(w, dtype=torch.double)
+
+
+def cosine_schedule_with_min_lr(
+    optimizer: torch.optim.Optimizer,
+    *,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float,
+) -> LambdaLR:
+    """Linear warmup, then cosine down to ``min_lr_ratio * peak`` (not to 0)."""
+    min_lr_ratio = min(max(float(min_lr_ratio), 0.0), 1.0)
+    warmup = max(int(num_warmup_steps), 0)
+    total = max(int(num_training_steps), 1)
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup:
+            return float(step + 1) / float(max(warmup, 1))
+        progress = (step - warmup) / float(max(total - warmup, 1))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return LambdaLR(optimizer, lr_lambda)
 
 
 def _finite_xy(history: list[dict], key: str) -> tuple[list[int], list[float]]:
@@ -335,7 +399,16 @@ def plot_training_curves(
     ax.set_title("Loss (weighted CE + Dice)")
     ax.set_xlabel("epoch")
     ax.grid(True, alpha=0.3)
-    if ax.lines:
+    xs_lr, ys_lr = _finite_xy(history, "lr")
+    if xs_lr:
+        ax_lr = ax.twinx()
+        ax_lr.plot(xs_lr, ys_lr, color="0.45", linestyle=":", linewidth=1.4, label="lr")
+        ax_lr.set_ylabel("learning rate")
+        ax_lr.tick_params(axis="y", labelsize=8)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax_lr.get_legend_handles_labels()
+        ax.legend(lines + lines2, labels + labels2)
+    elif ax.lines:
         ax.legend()
 
     ax = axes[0, 1]
@@ -674,7 +747,13 @@ def main() -> None:
     print(
         f"loss: CE water weight={args.ce_water_weight:g}  dice weight={args.dice_weight:g}  "
         f"oversample_sparse={not args.no_oversample_sparse}  "
-        f"water_crop_p={args.water_crop_p:g}"
+        f"small_boost={args.small_water_boost:g}  dry_w={args.dry_sample_weight:g}"
+    )
+    print(
+        f"scheduler: cosine  warmup_ratio={args.warmup_ratio:g}  "
+        f"min_lr_ratio={args.min_lr_ratio:g}  "
+        f"crop p={args.water_crop_p:g} min={args.water_crop_size} "
+        f"max={'full' if args.water_crop_max <= 0 else args.water_crop_max}"
     )
     print(f"data-root={root}")
     print(f"out-dir={args.out_dir}")
@@ -693,6 +772,7 @@ def main() -> None:
         augment=True,
         water_crop_p=args.water_crop_p,
         water_crop_size=args.water_crop_size,
+        water_crop_max=args.water_crop_max,
         **ds_kw,
     )
     val_ds = Sen1Floods11SegDataset(
@@ -723,14 +803,29 @@ def main() -> None:
         train_loader = DataLoader(train_ds, shuffle=True, **train_kw)
         print("  train sampler: uniform")
     else:
+        sampler_w = sparse_sample_weights(
+            train_counts,
+            small_water_max=args.small_water_max,
+            small_boost=args.small_water_boost,
+            dry_weight=args.dry_sample_weight,
+        )
         sampler = WeightedRandomSampler(
-            sparse_sample_weights(train_counts),
+            sampler_w,
             num_samples=len(train_ds),
             replacement=True,
             generator=torch.Generator().manual_seed(args.seed),
         )
         train_loader = DataLoader(train_ds, sampler=sampler, **train_kw)
-        print("  train sampler: WeightedRandomSampler 1/sqrt(water+1)")
+        p = sampler_w.numpy()
+        p = p / max(float(p.sum()), 1e-9)
+        dry_m = train_counts == 0
+        small_m = (train_counts > 0) & (train_counts <= args.small_water_max)
+        print(
+            "  train sampler: sparse-water boost "
+            f"(expected mix dry={p[dry_m].sum():.2f} "
+            f"small={p[small_m].sum():.2f} "
+            f"large={p[~(dry_m | small_m)].sum():.2f})"
+        )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
@@ -775,8 +870,15 @@ def main() -> None:
     steps_per_epoch = max(1, (len(train_loader) + args.grad_accum - 1) // args.grad_accum)
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+    scheduler = cosine_schedule_with_min_lr(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+        min_lr_ratio=args.min_lr_ratio,
+    )
+    print(
+        f"  lr={args.lr:g}  warmup_steps={warmup_steps}/{total_steps}  "
+        f"min_lr={args.lr * args.min_lr_ratio:g}"
     )
     scaler = make_grad_scaler(use_fp16) if device.type == "cuda" else None
 
@@ -849,6 +951,7 @@ def main() -> None:
         val_metrics = evaluate(model, val_loader, device, use_fp16, **eval_kw)
         dt = time.time() - t0
         small_iou = val_metrics.get("small_water_iou")
+        lr_now = float(scheduler.get_last_lr()[0])
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
@@ -860,6 +963,7 @@ def main() -> None:
             "val_f1_water": val_metrics["f1_water"],
             "val_small_water_iou": small_iou,
             "val_dry_fp_rate": val_metrics["dry_fp_rate"],
+            "lr": lr_now,
             "sec": dt,
         }
         history.append(row)
@@ -870,7 +974,8 @@ def main() -> None:
             f"val_water_iou={val_metrics['water_iou']:.4f}  "
             f"val_small_water_iou={small_s}  "
             f"val_recall={val_metrics['recall_water']:.4f}  "
-            f"val_dry_fp_rate={val_metrics['dry_fp_rate']:.3f}  ({dt:.1f}s)"
+            f"val_dry_fp_rate={val_metrics['dry_fp_rate']:.3f}  "
+            f"lr={lr_now:.2e}  ({dt:.1f}s)"
         )
 
         if not math.isfinite(train_loss) or not math.isfinite(val_metrics["loss"]):
@@ -978,11 +1083,16 @@ def main() -> None:
         "batch_size": args.batch_size,
         "grad_accum": args.grad_accum,
         "lr": args.lr,
+        "warmup_ratio": args.warmup_ratio,
+        "min_lr_ratio": args.min_lr_ratio,
         "ce_water_weight": args.ce_water_weight,
         "dice_weight": args.dice_weight,
         "oversample_sparse": not args.no_oversample_sparse,
+        "small_water_boost": args.small_water_boost,
+        "dry_sample_weight": args.dry_sample_weight,
         "water_crop_p": args.water_crop_p,
         "water_crop_size": args.water_crop_size,
+        "water_crop_max": args.water_crop_max,
         "small_water_max": args.small_water_max,
         "fp16": use_fp16,
         "device": str(device),
