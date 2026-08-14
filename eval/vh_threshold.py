@@ -24,12 +24,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-# Allow `python baselines/vh_threshold.py` from repo root or baselines/
+# Allow `python eval/vh_threshold.py` from repo root or eval/
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from baselines.common import (  # noqa: E402
+from eval.common import (  # noqa: E402
     add_confusion,
     choose_stems_for_viz,
     confusion_counts,

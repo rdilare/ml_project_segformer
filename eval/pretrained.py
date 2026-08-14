@@ -16,7 +16,7 @@ Does NOT download data. Point --data-root at your existing hand set:
       flood_test_data.csv
 
 Example:
-  python baselines/segformer_pretrained_eval.py \\
+  python eval/pretrained.py \\
     --data-root data/sen1floods11_hand \\
     --out-dir outputs/segformer_pretrained
 """
@@ -31,12 +31,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Allow `python baselines/segformer_pretrained_eval.py` from repo root
+# Allow `python eval/pretrained.py` from repo root
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from baselines.common import (  # noqa: E402
+from eval.common import (  # noqa: E402
     WATER,
     add_confusion,
     choose_stems_for_viz,

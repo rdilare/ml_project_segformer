@@ -46,6 +46,14 @@ lightning_logs/
 *.pkl
 *.joblib
 
+# Trained / downloaded weights (keep models/.gitkeep)
+models/
+models/**
+!models/.gitkeep
+*.safetensors
+*.bin
+/best_hf/
+
 # Dataset imagery (keep split CSVs tracked)
 data/**/Labels/
 data/**/S1/

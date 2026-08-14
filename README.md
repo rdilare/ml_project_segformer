@@ -52,7 +52,19 @@ Optional download if the folder is empty:
 pip install -r requirements.txt
 ```
 
-On Colab, also clone/upload this repo and `cd` into it so `train/` and `baselines/` import cleanly.
+On Colab, also clone/upload this repo and `cd` into it so `train/` and `eval/` import cleanly.
+
+Drop a Hugging Face checkpoint at `models/best_hf/` (`config.json` + `model.safetensors`). Weights are gitignored.
+
+## Local UI
+
+Browse chips, run inference, evaluate splits, and launch baselines from the browser:
+
+```bash
+streamlit run app.py
+```
+
+Set **Data root** (default `data/sen1floods11_hand`) and **Model dir** (default `models/best_hf/`) in the sidebar. The Results tab reads `outputs/*/metrics.json`.
 
 ## Fine-tune (Colab T4)
 
@@ -82,22 +94,35 @@ Outputs under `--out-dir`:
 
 - `last.pt` — full train state every epoch (use to resume)
 - `best.pt` / `best_hf/` — best weights by val water IoU
-- `metrics.json` — val + test scores
+- `metrics.json` — val + test scores (includes `small_water_iou`, `dry_fp_rate`)
 - `history.json` — per-epoch log (updated each epoch)
+- `figures/training_curves.png` — loss, IoU, precision/recall, dry-chip FP rate
 - `figures/` — qualitative panels
 
 Resume after Colab disconnect / interrupt: re-run the **same** command with the
 same `--out-dir`. It auto-loads `last.pt` (else `best.pt`) when present; if
 none exist, it starts from scratch. Force a fresh run with `--no-resume`.
 
+This loss/sampling change is not compatible with old CE-only checkpoints — use
+a new `--out-dir` or `--no-resume`.
+
 Compare test **water IoU** to the VH threshold baseline (~0.53).
 
-## Baselines (already implemented)
+Copy the best Hugging Face folder into the repo for local inference / eval:
 
 ```bash
-# VH threshold
-python baselines/vh_threshold.py --data-root data/sen1floods11_hand
+cp -r /content/drive/MyDrive/sen1floods11_hand/runs/segformer_ft/best_hf models/best_hf
+```
+
+## Eval
+
+```bash
+# Fine-tuned SegFormer (needs models/best_hf/)
+python eval/finetuned.py --split test --num-viz 8
+
+# VH threshold baseline
+python eval/vh_threshold.py --data-root data/sen1floods11_hand
 
 # Pretrained SegFormer (no fine-tune)
-python baselines/segformer_pretrained_eval.py --data-root data/sen1floods11_hand
+python eval/pretrained.py --data-root data/sen1floods11_hand
 ```

@@ -2,10 +2,10 @@
 """Show VV, VH, and ground-truth (if present) for a Sen1Floods11 chip.
 
 Examples:
-  python baselines/show_s1_chip.py \\
+  python scripts/show_s1_chip.py \\
     --chip data/sen1floods11_hand/S1/Bolivia_23014_S1Hand.tif
 
-  python baselines/show_s1_chip.py \\
+  python scripts/show_s1_chip.py \\
     --data-root data/sen1floods11_hand --stem Bolivia_23014 --save
 """
 

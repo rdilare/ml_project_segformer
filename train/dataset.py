@@ -13,6 +13,7 @@ Expected layout (local or Colab Drive)::
 
 from __future__ import annotations
 
+import random
 import sys
 from pathlib import Path
 
@@ -24,8 +25,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from baselines.common import (  # noqa: E402
+from eval.common import (  # noqa: E402
     IGNORE_INDEX,
+    WATER,
+    load_label,
     load_s1_and_label,
     normalize_imagenet_chw,
     read_split_stems,
@@ -60,6 +63,32 @@ def build_eval_augs() -> A.Compose:
     return A.Compose([])
 
 
+def water_centered_crop(
+    rgb01: np.ndarray,
+    label: np.ndarray,
+    crop_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Crop around a random water pixel so thin streams occupy more of the tensor.
+
+    Dry chips (no class-1 pixels) are returned unchanged.
+    """
+    h, w = label.shape[:2]
+    crop = min(int(crop_size), h, w)
+    if crop <= 0 or (crop == h and crop == w):
+        return rgb01, label
+    ys, xs = np.where(label == WATER)
+    if ys.size == 0:
+        return rgb01, label
+    i = int(random.randrange(int(ys.size)))
+    cy, cx = int(ys[i]), int(xs[i])
+    y0 = min(max(cy - crop // 2, 0), h - crop)
+    x0 = min(max(cx - crop // 2, 0), w - crop)
+    return (
+        rgb01[y0 : y0 + crop, x0 : x0 + crop],
+        label[y0 : y0 + crop, x0 : x0 + crop],
+    )
+
+
 class Sen1Floods11SegDataset(Dataset):
     """Yields ``pixel_values`` (3,H,W) float32 and ``labels`` (H,W) int64."""
 
@@ -74,6 +103,8 @@ class Sen1Floods11SegDataset(Dataset):
         db_min: float = -30.0,
         db_max: float = 0.0,
         augment: bool = False,
+        water_crop_p: float = 0.0,
+        water_crop_size: int = 256,
     ) -> None:
         self.data_root = Path(data_root)
         self.s1_dir = s1_dir
@@ -81,7 +112,10 @@ class Sen1Floods11SegDataset(Dataset):
         self.image_size = image_size
         self.db_min = db_min
         self.db_max = db_max
+        self.water_crop_p = float(water_crop_p)
+        self.water_crop_size = int(water_crop_size)
         self.augs = build_train_augs() if augment else build_eval_augs()
+        self._water_counts: np.ndarray | None = None
 
         stems = read_split_stems(Path(split_csv))
         self.samples: list[tuple[str, Path, Path]] = []
@@ -105,6 +139,16 @@ class Sen1Floods11SegDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def water_pixel_counts(self) -> np.ndarray:
+        """GT water pixels per chip (ignore / nodata excluded). Cached after first call."""
+        if self._water_counts is None:
+            counts = []
+            for _stem, _s1_path, lab_path in self.samples:
+                label = load_label(lab_path)
+                counts.append(int((label == WATER).sum()))
+            self._water_counts = np.asarray(counts, dtype=np.int64)
+        return self._water_counts
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         stem, s1_path, lab_path = self.samples[idx]
         vv, vh, label = load_s1_and_label(s1_path, lab_path)
@@ -117,6 +161,9 @@ class Sen1Floods11SegDataset(Dataset):
             out = self.augs(image=rgb01, mask=label)
             rgb01 = out["image"]
             label = out["mask"]
+
+        if self.water_crop_p > 0.0 and random.random() < self.water_crop_p:
+            rgb01, label = water_centered_crop(rgb01, label, self.water_crop_size)
 
         # Clip after multiplicative noise; keep ignore pixels as IGNORE_INDEX
         rgb01 = np.clip(rgb01, 0.0, 1.0).astype(np.float32)
